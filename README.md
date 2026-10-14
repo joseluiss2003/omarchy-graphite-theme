@@ -15,3 +15,5 @@ También desde el menú de Omarchy: Install → Style → Theme, y pega la URL d
 ```bash
 omarchy theme set graphite
 ```
+
+Al elegirlo, el fondo es `backgrounds/0-liquid-metal.jpg`. La intro `backgrounds/intros/0-liquid-metal.mp4` se reproduce en ese cambio. Los otros fondos siguen en el tema y se recorren con `omarchy theme bg next`.
