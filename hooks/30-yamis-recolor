@@ -1,0 +1,114 @@
+#!/bin/bash
+# Keep the YAMIS icon theme selected and recolor its ink to the active
+# Omarchy theme. The upstream SVGs paint with a KDE ColorScheme class, which
+# Plasma would retint and GTK/Quickshell will not, so the color is written
+# into each icon when the theme changes.
+set -u
+
+source_dir="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy/icons/YAMIS-source"
+dest_dir="${XDG_DATA_HOME:-$HOME/.local/share}/icons/YAMIS"
+colors_file="$HOME/.local/state/omarchy/current/theme/colors.toml"
+stamp_file="$HOME/.local/state/omarchy/yamis-colors"
+upstream_url="https://github.com/googIyEYES/YAMIS/raw/main/monochrome-icon-theme.tar.gz"
+
+[[ -f $colors_file ]] || exit 0
+
+ensure_source() {
+  local tmp archive
+  tmp=$(mktemp -d)
+  archive="$tmp/monochrome-icon-theme.tar.gz"
+  if ! curl -fsSL -o "$archive" "$upstream_url"; then
+    echo "YAMIS download failed: $upstream_url" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! tar -xzf "$archive" -C "$tmp"; then
+    echo "YAMIS archive could not be extracted" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  if [[ ! -f $tmp/YAMIS/index.theme ]]; then
+    echo "YAMIS archive has no YAMIS/index.theme" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  sed -i 's/^Name=.*/Name=YAMIS/' "$tmp/YAMIS/index.theme"
+  mkdir -p "${source_dir%/*}"
+  rm -rf "$source_dir"
+  mv "$tmp/YAMIS" "$source_dir"
+  rm -rf "$tmp"
+}
+
+if [[ ! -f $source_dir/index.theme ]]; then
+  ensure_source || exit 0
+fi
+
+text=$(omarchy-theme-color --file "$colors_file" foreground 2>/dev/null || true)
+highlight=$(omarchy-theme-color --file "$colors_file" accent 2>/dev/null || true)
+[[ $text =~ ^#[0-9A-Fa-f]{6}$ && $highlight =~ ^#[0-9A-Fa-f]{6}$ ]] || exit 0
+
+source_mtime=$(stat -Lc '%Y' "$source_dir/index.theme")
+want=$(printf 'text=%s\nhighlight=%s\nsource_mtime=%s\n' "$text" "$highlight" "$source_mtime")
+current=$(cat "$stamp_file" 2>/dev/null || true)
+
+if [[ ! -f $dest_dir/index.theme || $current != "$want" ]]; then
+  if [[ ! -f $dest_dir/index.theme || $(awk -F= '/^source_mtime=/{print $2}' <<<"$current") != "$source_mtime" ]]; then
+    rm -rf "$dest_dir"
+    mkdir -p "${dest_dir%/*}"
+    cp -a "$source_dir" "$dest_dir"
+  fi
+  python3 - "$text" "$highlight" "$dest_dir" <<'PY'
+import os, re, sys
+text_color, highlight_color, root = sys.argv[1:]
+style = re.compile(r'(<style\b[^>]*\bid="current-color-scheme"[^>]*>)(.*?)(</style>)', re.S)
+text_re = re.compile(r'(\.ColorScheme-Text\s*\{[^}]*?\bcolor:\s*)#[0-9A-Fa-f]{3,8}', re.I)
+highlight_re = re.compile(r'(\.ColorScheme-Highlight\s*\{[^}]*?\bcolor:\s*)#[0-9A-Fa-f]{3,8}', re.I)
+changed = 0
+for dirpath, _, files in os.walk(root):
+    for name in files:
+        if not name.endswith(".svg"):
+            continue
+        path = os.path.join(dirpath, name)
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            data = handle.read()
+        def repl(match, text_color=text_color, highlight_color=highlight_color):
+            body = text_re.sub(lambda m: m.group(1) + text_color, match.group(2), count=1)
+            body = highlight_re.sub(lambda m: m.group(1) + highlight_color, body, count=1)
+            return match.group(1) + body + match.group(3)
+        updated, count = style.subn(repl, data, count=1)
+        if count and updated != data:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(updated)
+            changed += 1
+print(f"recolored {changed}")
+PY
+  mkdir -p "${stamp_file%/*}"
+  printf '%s\n' "$want" >"$stamp_file"
+  gtk-update-icon-cache -f -q "$dest_dir" || true
+  colors_changed=1
+else
+  colors_changed=0
+fi
+
+if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]]; then
+  gsettings set org.gnome.desktop.interface icon-theme "YAMIS"
+fi
+
+# A new ink color has to be a new file path before Quickshell will paint it:
+# its image cache keys the URL, and these paths stay put, so the shell process
+# has to start clean. Wait out a theme intro first; restarting kills it.
+if (( colors_changed )) && { [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] || [[ -d ${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr ]]; }; then
+  setsid bash -c '
+    lock="$HOME/.local/state/omarchy/background-intro.lock"
+    if [[ -e $lock ]]; then
+      exec 9>"$lock"
+      for _ in $(seq 1 30); do
+        flock -n 9 && break
+        sleep 0.5
+      done
+      flock -u 9 || true
+      exec 9>&-
+    fi
+    exec omarchy restart shell
+  ' </dev/null >/dev/null 2>&1 &
+fi
